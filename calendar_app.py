@@ -16,6 +16,7 @@
 import calendar
 import json
 import os
+import re
 import tkinter as tk
 from datetime import date
 from tkinter import font as tkfont, messagebox
@@ -42,8 +43,19 @@ def tasks_file_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.json")
 
 
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def parse_time(value: str) -> str | None:
+    """Проверить строку «ЧЧ:ММ» (можно без ведущего нуля). Вернуть «HH:MM» или None."""
+    m = TIME_RE.match(value.strip())
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
 class TaskStore:
-    """Хранилище задач: {iso_дата: [ {"text": str, "done": bool}, ... ]}"""
+    """Хранилище задач: {iso_дата: [ {"text": str, "time": "HH:MM", "done": bool}, ... ]}"""
 
     def __init__(self, path: str):
         self.path = path
@@ -72,8 +84,10 @@ class TaskStore:
     def get(self, d: date) -> list[dict]:
         return self.data.get(d.isoformat(), [])
 
-    def add(self, d: date, text: str) -> None:
-        self.data.setdefault(d.isoformat(), []).append({"text": text, "done": False})
+    def add(self, d: date, text: str, time: str = "") -> None:
+        self.data.setdefault(d.isoformat(), []).append(
+            {"text": text, "time": time, "done": False}
+        )
         self.save()
 
     def remove(self, d: date, index: int) -> None:
@@ -140,12 +154,29 @@ class DayScreen(tk.Frame):
         self.entry.bind("<FocusIn>", self._on_focus_in)
         self.entry.bind("<FocusOut>", self._on_focus_out)
 
+        # Поле времени (обязательное): формат ЧЧ:ММ
+        tk.Label(form, text="Время:", bg=BG_MAIN, fg=TEXT_DARK,
+                 font=("Segoe UI", 11)).pack(side="right", padx=(0, 6))
+        self.time_entry = tk.Entry(
+            form, font=("Segoe UI", 12), relief="flat", width=6,
+            bg=BG_CARD, fg=TEXT_DARK, insertbackground=TEXT_DARK, justify="center",
+        )
+        self.time_entry.pack(side="right", padx=(0, 8), ipady=8)
+        # Звёздочка — поле времени обязательно при создании задачи
+        tk.Label(form, text="*", bg=BG_MAIN, fg="#e74c3c",
+                 font=("Segoe UI", 12, "bold")).pack(side="right", padx=(0, 2))
+        self.time_placeholder = "ЧЧ:ММ"
+        self._show_time_placeholder()
+        self.time_entry.bind("<FocusIn>", self._on_time_focus_in)
+        self.time_entry.bind("<FocusOut>", self._on_time_focus_out)
+        self.time_entry.bind("<Return>", lambda e: self.add_task())
+
         tk.Button(
             form, text="Добавить", command=self.add_task,
             bg=ACCENT, fg="white", activebackground=ACCENT_DARK,
             activeforeground="white", relief="flat",
             font=("Segoe UI", 11, "bold"), padx=18, pady=6, cursor="hand2",
-        ).pack(side="right")
+        ).pack(side="right", padx=(0, 8))
 
         # --- Список задач (скроллируемый) ------------------------------------
         list_wrap = tk.Frame(self, bg=BG_CARD, highlightthickness=1,
@@ -179,6 +210,7 @@ class DayScreen(tk.Frame):
         self.font_normal = tkfont.Font(name="TaskFontNormal", font=("Segoe UI", 12))
         self.font_done = tkfont.Font(name="TaskFontDone", font=("Segoe UI", 12),
                                      overstrike=1)
+        self.font_time = tkfont.Font(name="TaskFontTime", font=("Segoe UI", 12, "bold"))
 
     # ---------- жизненный цикл экрана ----------
     def open_for(self, d: date) -> None:
@@ -188,6 +220,8 @@ class DayScreen(tk.Frame):
             text=f"{d.day} {MONTHS_RU[d.month - 1].lower()} {d.year} г."
         )
         self._render_tasks()
+        # Так как время обязательно, при открытии дня фокус сразу в поле «Время»
+        self.after(50, self.time_entry.focus_set)
 
     def _on_mousewheel(self, event) -> None:
         if event.num == 5 or getattr(event, "delta", 0) < 0:
@@ -210,6 +244,21 @@ class DayScreen(tk.Frame):
         if not self.entry.get().strip():
             self._show_placeholder()
 
+    # ---------- плейсхолдер поля времени ----------
+    def _show_time_placeholder(self) -> None:
+        self.time_entry.delete(0, "end")
+        self.time_entry.insert(0, self.time_placeholder)
+        self.time_entry.config(fg=DONE_FG)
+
+    def _on_time_focus_in(self, _e) -> None:
+        if self.time_entry.get() == self.time_placeholder:
+            self._show_time_placeholder()
+            self.time_entry.config(fg=TEXT_DARK)
+
+    def _on_time_focus_out(self, _e) -> None:
+        if not self.time_entry.get().strip():
+            self._show_time_placeholder()
+
     # ---------- действия с задачами ----------
     def add_task(self) -> None:
         if self.current_date is None:
@@ -217,11 +266,33 @@ class DayScreen(tk.Frame):
         text = self.entry.get().strip()
         if not text or text == self.placeholder:
             messagebox.showinfo("Пустая задача", "Введите текст задачи.", parent=self)
+            self.entry.focus_set()
+            return
+        time_raw = self.time_entry.get().strip()
+        if not time_raw or time_raw == self.time_placeholder:
+            messagebox.showinfo(
+                "Не указано время",
+                "Укажите время задачи в формате ЧЧ:ММ (например, 09:30).",
+                parent=self,
+            )
+            self.time_entry.focus_set()
+            return
+        time_value = parse_time(time_raw)
+        if time_value is None:
+            messagebox.showinfo(
+                "Неверное время",
+                "Время должно быть в формате ЧЧ:ММ от 00:00 до 23:59 "
+                "(например, 09:30).",
+                parent=self,
+            )
+            self.time_entry.focus_set()
             return
         store = self.app.store
-        store.add(self.current_date, text)
+        store.add(self.current_date, text, time_value)
         self._show_placeholder()
         self.entry.config(fg=TEXT_DARK)
+        self._show_time_placeholder()
+        self.time_entry.config(fg=TEXT_DARK)
         self._render_tasks()
         self.app.refresh_calendar()
 
@@ -260,6 +331,13 @@ class DayScreen(tk.Frame):
                     command=lambda idx=i: self.on_toggle(idx), cursor="hand2",
                 )
                 chk.pack(side="left")
+
+                time_text = str(task.get("time", "")).strip()
+                if time_text:
+                    tk.Label(
+                        row, text=time_text, bg=BG_CARD, fg=ACCENT,
+                        anchor="w", font=self.font_time,
+                    ).pack(side="left", padx=(0, 8))
 
                 lbl = tk.Label(
                     row, text=task.get("text", ""),
